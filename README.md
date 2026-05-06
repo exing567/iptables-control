@@ -38,7 +38,8 @@
 ## 快速开始
 
 ```bash
-sudo bash ipt.sh
+sudo bash <(curl -L https://raw.githubusercontent.com/exing567/iptables-control/main/ipt.sh)
+
 ```
 
 如果想先给脚本添加执行权限，也可以这样运行：
