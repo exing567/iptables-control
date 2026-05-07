@@ -38,16 +38,9 @@
 ## 快速开始
 
 ```bash
-sudo bash <(curl -L https://raw.githubusercontent.com/exing567/iptables-control/main/ipt.sh)
-
+curl -L https://raw.githubusercontent.com/exing567/iptables-control/main/ipt.sh -o ipt.sh && chmod +x ipt.sh && sudo bash ipt.sh
 ```
-
-如果想先给脚本添加执行权限，也可以这样运行：
-
-```bash
-chmod +x ipt.sh
-sudo ./ipt.sh
-```
+运行此指令一次之后，再次运行只用输入`sudo bash ipt.sh`即可
 
 启动后会进入交互菜单，根据编号选择对应功能。
 
