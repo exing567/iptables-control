@@ -3,10 +3,11 @@
 set -u
 
 APP_NAME="ipt-forward-manager"
-VERSION="2.0"
+VERSION="2.2"
 DEFAULT_COMMENT_PREFIX="xjj-forward"
 BACKUP_DIR="/root/iptables-backup"
 CONF_DIR="/root/iptables-forward-conf"
+MANAGED_CONF="$CONF_DIR/managed-forwards.conf"
 LOG_FILE="/var/log/ipt-forward-manager.log"
 SELF_PATH="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 
@@ -174,6 +175,135 @@ ask_protocols() {
   echo "$protocols"
 }
 
+ask_protocols_for_delete() {
+  echo >&2
+  echo "请选择要删除的协议，未选择的协议会保留：" >&2
+  echo "1) TCP" >&2
+  echo "2) UDP" >&2
+  echo "3) TCP + UDP" >&2
+  read -rp "请选择 [默认 3]: " proto_choice >&2
+  proto_choice="${proto_choice:-3}"
+
+  local protocols
+  protocols="$(protocols_from_choice "$proto_choice")"
+
+  if [ -z "$protocols" ]; then
+    echo -e "${RED}协议选择无效。${RESET}" >&2
+    return 1
+  fi
+
+  echo "$protocols"
+}
+
+protocol_label() {
+  local protocols="$1"
+
+  if echo "$protocols" | grep -qw "tcp" && echo "$protocols" | grep -qw "udp"; then
+    echo "tcp+udp"
+  else
+    echo "$protocols"
+  fi
+}
+
+is_ipv4() {
+  local value="$1"
+  echo "$value" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+}
+
+resolve_target() {
+  local target="$1"
+  local resolved=""
+
+  if is_ipv4 "$target"; then
+    echo "$target"
+    return 0
+  fi
+
+  if command -v getent >/dev/null 2>&1; then
+    resolved="$(getent ahostsv4 "$target" | awk '{print $1; exit}')"
+  fi
+
+  if [ -z "$resolved" ] && command -v dig >/dev/null 2>&1; then
+    resolved="$(dig +short A "$target" | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$' | head -n 1)"
+  fi
+
+  if [ -z "$resolved" ] && command -v host >/dev/null 2>&1; then
+    resolved="$(host -t A "$target" | awk '/has address/ {print $4; exit}')"
+  fi
+
+  if [ -z "$resolved" ]; then
+    return 1
+  fi
+
+  echo "$resolved"
+}
+
+register_forward_config() {
+  local in_port="$1"
+  local target_host="$2"
+  local target_port="$3"
+  local proto="$4"
+  local comment="$5"
+  local tmp
+
+  safe_mkdirs
+  touch "$MANAGED_CONF"
+  tmp="$(mktemp)"
+
+  awk -v in_port="$in_port" -v target_port="$target_port" -v proto="$proto" -v comment="$comment" '
+    NF < 5 { next }
+    !($1 == in_port && $3 == target_port && $4 == proto && $5 == comment) { print }
+  ' "$MANAGED_CONF" > "$tmp"
+
+  echo "$in_port $target_host $target_port $proto $comment" >> "$tmp"
+  mv "$tmp" "$MANAGED_CONF"
+  log "managed config updated: $in_port $target_host $target_port $proto $comment"
+}
+
+remove_managed_forward_config() {
+  local in_port="$1"
+  local target_port="$2"
+  local proto="$3"
+  local comment="$4"
+  local tmp
+
+  [ -f "$MANAGED_CONF" ] || return
+  tmp="$(mktemp)"
+
+  awk -v in_port="$in_port" -v target_port="$target_port" -v proto="$proto" -v comment="$comment" '
+    NF < 5 { next }
+    !($1 == in_port && $3 == target_port && $4 == proto && $5 == comment) { print }
+  ' "$MANAGED_CONF" > "$tmp"
+
+  mv "$tmp" "$MANAGED_CONF"
+  log "managed config removed: in=$in_port target_port=$target_port proto=$proto comment=$comment"
+}
+
+remove_managed_by_comment() {
+  local comment="$1"
+  local tmp
+
+  [ -f "$MANAGED_CONF" ] || return
+  tmp="$(mktemp)"
+
+  awk -v comment="$comment" 'NF < 5 { next } $5 != comment { print }' "$MANAGED_CONF" > "$tmp"
+  mv "$tmp" "$MANAGED_CONF"
+  log "managed config removed by comment: $comment"
+}
+
+managed_target_for_rule() {
+  local in_port="$1"
+  local target_port="$2"
+  local proto="$3"
+  local comment="$4"
+
+  [ -f "$MANAGED_CONF" ] || return
+
+  awk -v in_port="$in_port" -v target_port="$target_port" -v proto="$proto" -v comment="$comment" '
+    $1 == in_port && $3 == target_port && $4 == proto && $5 == comment { print $2; exit }
+  ' "$MANAGED_CONF"
+}
+
 # Extract comment from iptables-save rule line, supports both quoted and unquoted
 get_rule_comment() {
   local line="$1"
@@ -183,7 +313,9 @@ get_rule_comment() {
 # Generate grep pattern for comment, supports --comment sunny-use and --comment "sunny-use"
 comment_grep_pattern() {
   local comment="$1"
-  printf '%s' "--comment \"?${comment}\"?( |$)"
+  local escaped
+  escaped="$(printf '%s' "$comment" | sed 's/[][(){}.^$*+?|\\]/\\&/g')"
+  printf '%s' "--comment \"?${escaped}\"?( |$)"
 }
 
 rule_exists_nat() {
@@ -200,10 +332,21 @@ rule_exists_filter() {
 
 add_one_forward() {
   local in_port="$1"
-  local target_ip="$2"
+  local target_host="$2"
   local target_port="$3"
   local proto="$4"
   local comment="$5"
+  local target_ip
+
+  if ! target_ip="$(resolve_target "$target_host")"; then
+    echo -e "${RED}目标解析失败：$target_host${RESET}"
+    log "resolve failed target=$target_host proto=$proto in=$in_port target_port=$target_port comment=$comment"
+    return 1
+  fi
+
+  if [ "$target_host" != "$target_ip" ]; then
+    echo -e "${CYAN}域名解析：$target_host -> $target_ip${RESET}"
+  fi
 
   if rule_exists_nat PREROUTING -p "$proto" --dport "$in_port" -m comment --comment "$comment" -j DNAT --to-destination "$target_ip:$target_port"; then
     echo -e "${YELLOW}已存在：$proto PREROUTING $in_port -> $target_ip:$target_port${RESET}"
@@ -226,22 +369,112 @@ add_one_forward() {
     echo -e "${GREEN}已添加：$proto FORWARD ACCEPT $target_ip:$target_port${RESET}"
   fi
 
-  log "add forward proto=$proto in=$in_port target=$target_ip:$target_port comment=$comment"
+  register_forward_config "$in_port" "$target_host" "$target_port" "$proto" "$comment"
+  log "add forward proto=$proto in=$in_port target=$target_host($target_ip):$target_port comment=$comment"
 }
 
-delete_one_forward_exact() {
+delete_one_forward_selected() {
   local in_port="$1"
   local target_ip="$2"
   local target_port="$3"
   local proto="$4"
+  local comment="$5"
 
-  iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" -j DNAT --to-destination "$target_ip:$target_port" 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -p "$proto" -d "$target_ip" --dport "$target_port" -j MASQUERADE 2>/dev/null || true
-  iptables -D FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -j ACCEPT 2>/dev/null || true
+  while rule_exists_nat PREROUTING -p "$proto" --dport "$in_port" -m comment --comment "$comment" -j DNAT --to-destination "$target_ip:$target_port"; do
+    iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" -m comment --comment "$comment" -j DNAT --to-destination "$target_ip:$target_port"
+  done
 
-  iptables -t nat -D PREROUTING -p "$proto" --dport "$in_port" -m comment --comment "${DEFAULT_COMMENT_PREFIX}-${in_port}-to-${target_ip}-${target_port}" -j DNAT --to-destination "$target_ip:$target_port" 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "${DEFAULT_COMMENT_PREFIX}-${in_port}-to-${target_ip}-${target_port}" -j MASQUERADE 2>/dev/null || true
-  iptables -D FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "${DEFAULT_COMMENT_PREFIX}-${in_port}-to-${target_ip}-${target_port}" -j ACCEPT 2>/dev/null || true
+  while rule_exists_nat POSTROUTING -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "$comment" -j MASQUERADE; do
+    iptables -t nat -D POSTROUTING -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "$comment" -j MASQUERADE
+  done
+
+  while rule_exists_filter FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "$comment" -j ACCEPT; do
+    iptables -D FORWARD -p "$proto" -d "$target_ip" --dport "$target_port" -m comment --comment "$comment" -j ACCEPT
+  done
+
+  log "delete selected forward proto=$proto in=$in_port target=$target_ip:$target_port comment=$comment"
+}
+
+delete_saved_forward_rules() {
+  local in_port="$1"
+  local target_port="$2"
+  local proto="$3"
+  local comment="$4"
+  local current_ip
+
+  while current_ip="$(current_forward_target_ip "$in_port" "$target_port" "$proto" "$comment")"; [ -n "$current_ip" ]; do
+    delete_one_forward_selected "$in_port" "$current_ip" "$target_port" "$proto" "$comment"
+  done
+
+  log "delete saved forward rules proto=$proto in=$in_port target_port=$target_port comment=$comment"
+}
+
+current_forward_target_ip() {
+  local in_port="$1"
+  local target_port="$2"
+  local proto="$3"
+  local comment="$4"
+  local pattern
+  pattern="$(comment_grep_pattern "$comment")"
+
+  iptables-save -t nat | grep -E -- "$pattern" | grep "^-A PREROUTING" | grep -- "-p $proto " | grep -E -- "--dport $in_port( |$)" | grep -E -- "--to-destination [^ ]+:$target_port( |$)" | head -n 1 | grep -oE -- '--to-destination [^ ]+' | awk '{print $2}' | awk -F: '{print $1}'
+}
+
+refresh_managed_domain_forwards() {
+  safe_mkdirs
+
+  if [ ! -f "$MANAGED_CONF" ] || [ ! -s "$MANAGED_CONF" ]; then
+    log "ddns refresh skipped: no managed config"
+    return 0
+  fi
+
+  local tmp
+  local changed=0
+  tmp="$(mktemp)"
+  cp "$MANAGED_CONF" "$tmp"
+
+  while read -r in_port target_host target_port proto comment _rest; do
+    [ -z "${in_port:-}" ] && continue
+    echo "$in_port" | grep -q '^#' && continue
+    if [ -z "${target_host:-}" ] || [ -z "${target_port:-}" ] || [ -z "${proto:-}" ] || [ -z "${comment:-}" ]; then
+      log "ddns refresh skipped malformed line: $in_port ${target_host:-} ${target_port:-} ${proto:-} ${comment:-}"
+      continue
+    fi
+
+    if is_ipv4 "$target_host"; then
+      continue
+    fi
+
+    local resolved_ip
+    if ! resolved_ip="$(resolve_target "$target_host")"; then
+      echo -e "${YELLOW}域名解析失败，跳过：$target_host${RESET}"
+      log "ddns refresh resolve failed target=$target_host proto=$proto in=$in_port target_port=$target_port comment=$comment"
+      continue
+    fi
+
+    local current_ip
+    current_ip="$(current_forward_target_ip "$in_port" "$target_port" "$proto" "$comment")"
+
+    if [ "$current_ip" = "$resolved_ip" ]; then
+      log "ddns refresh unchanged target=$target_host ip=$resolved_ip proto=$proto in=$in_port comment=$comment"
+      continue
+    fi
+
+    echo -e "${CYAN}刷新域名转发：$target_host $current_ip -> $resolved_ip ($proto $in_port -> $target_port)${RESET}"
+    delete_saved_forward_rules "$in_port" "$target_port" "$proto" "$comment"
+    add_one_forward "$in_port" "$target_host" "$target_port" "$proto" "$comment"
+    changed=1
+  done < "$tmp"
+
+  rm -f "$tmp"
+
+  if [ "$changed" -eq 1 ]; then
+    save_rules
+    log "ddns refresh changed and saved"
+  else
+    echo -e "${GREEN}域名转发无需更新。${RESET}"
+    log "ddns refresh no changes"
+  fi
 }
 
 delete_by_comment_core() {
@@ -263,7 +496,72 @@ delete_by_comment_core() {
     iptables -t nat $rule
   done
 
+  remove_managed_by_comment "$comment"
   log "delete by comment: $comment"
+}
+
+collect_forward_configs() {
+  local out_file="$1"
+  local raw_file
+  raw_file="$(mktemp)"
+
+  iptables-save -t nat | grep "^-A PREROUTING" | grep "DNAT" | while read -r line; do
+    proto="$(echo "$line" | grep -oE -- '-p (tcp|udp)' | awk '{print $2}')"
+    in_port="$(echo "$line" | grep -oE -- '--dport [0-9]+' | awk '{print $2}' | head -n 1)"
+    target="$(echo "$line" | grep -oE -- '--to-destination [^ ]+' | awk '{print $2}')"
+    target_ip="${target%:*}"
+    target_port="${target##*:}"
+    comment="$(get_rule_comment "$line")"
+
+    [ -z "$comment" ] && continue
+    [ -z "$proto" ] && continue
+    [ -z "$in_port" ] && continue
+    [ -z "$target_ip" ] && continue
+    [ -z "$target_port" ] && continue
+
+    echo "$comment|$in_port|$target_ip|$target_port|$proto" >> "$raw_file"
+  done
+
+  if [ ! -s "$raw_file" ]; then
+    : > "$out_file"
+    rm -f "$raw_file"
+    return
+  fi
+
+  sort -t '|' -k1,1 -k2,2n -k3,3 -k4,4 -k5,5 "$raw_file" | awk -F'|' '
+    {
+      key=$1 FS $2 FS $3 FS $4
+      if (!(key in seen)) {
+        seen[key]=1
+        keys[++count]=key
+      }
+      if ($5 == "tcp") {
+        has_tcp[key]=1
+      }
+      if ($5 == "udp") {
+        has_udp[key]=1
+      }
+    }
+    END {
+      for (i=1; i<=count; i++) {
+        key=keys[i]
+        protocols=""
+        if (has_tcp[key]) {
+          protocols="tcp"
+        }
+        if (has_udp[key]) {
+          if (protocols == "") {
+            protocols="udp"
+          } else {
+            protocols=protocols " udp"
+          }
+        }
+        print key FS protocols
+      }
+    }
+  ' > "$out_file"
+
+  rm -f "$raw_file"
 }
 
 add_forward_interactive() {
@@ -271,7 +569,7 @@ add_forward_interactive() {
   echo -e "${BLUE}添加单条端口转发。${RESET}"
 
   read -rp "入站端口，例如 8443: " in_port
-  read -rp "目标 IP，例如 1.1.1.1: " target_ip
+  read -rp "目标 IP/域名，例如 1.1.1.1 或 home.example.com: " target_ip
   read -rp "目标端口，例如 443: " target_port
 
   protocols="$(ask_protocols)" || return
@@ -279,7 +577,7 @@ add_forward_interactive() {
   read -rp "备注，例如 xjj-forward-8443，留空自动生成: " comment
 
   if [ -z "$in_port" ] || [ -z "$target_ip" ] || [ -z "$target_port" ]; then
-    echo -e "${RED}入站端口、目标 IP、目标端口不能为空。${RESET}"
+    echo -e "${RED}入站端口、目标 IP/域名、目标端口不能为空。${RESET}"
     return
   fi
 
@@ -313,13 +611,13 @@ add_forward_interactive() {
 
 batch_add_forward() {
   echo
-  echo -e "${BLUE}批量添加转发。格式：入站端口 目标IP 目标端口 协议 备注${RESET}"
+  echo -e "${BLUE}批量添加转发。格式：入站端口 目标IP或域名 目标端口 协议 备注${RESET}"
   echo
   echo "协议支持：tcp / udp / both"
   echo
   echo "例如："
   echo "443 1.1.1.1 443 both xjj-forward-443"
-  echo "8443 1.1.1.1 443 tcp xjj-forward-8443"
+  echo "8443 home.example.com 443 tcp xjj-forward-8443"
   echo
   echo "输入完成后，单独输入 END 结束。"
   echo
@@ -344,8 +642,8 @@ batch_add_forward() {
 
   echo
   echo -e "${CYAN}解析到以下配置：${RESET}"
-  printf "%-8s %-18s %-10s %-10s %-30s\n" "入站" "目标IP" "目标端口" "协议" "备注"
-  printf "%-8s %-18s %-10s %-10s %-30s\n" "----" "------" "--------" "----" "----"
+  printf "%-8s %-28s %-10s %-10s %-30s\n" "入站" "目标IP/域名" "目标端口" "协议" "备注"
+  printf "%-8s %-28s %-10s %-10s %-30s\n" "----" "----------" "--------" "----" "----"
 
   for line in "${lines[@]}"; do
     in_port="$(echo "$line" | awk '{print $1}')"
@@ -357,7 +655,7 @@ batch_add_forward() {
     [ -z "$proto_input" ] && proto_input="both"
     [ -z "$comment" ] && comment="${DEFAULT_COMMENT_PREFIX}-${in_port}-to-${target_ip}-${target_port}"
 
-    printf "%-8s %-18s %-10s %-10s %-30s\n" "$in_port" "$target_ip" "$target_port" "$proto_input" "$comment"
+    printf "%-8s %-28s %-10s %-10s %-30s\n" "$in_port" "$target_ip" "$target_port" "$proto_input" "$comment"
   done
 
   echo
@@ -404,27 +702,75 @@ batch_add_forward() {
 
 delete_by_comment() {
   echo
-  read -rp "请输入要删除的备注 comment，例如 xjj-forward-8443: " comment
+  echo -e "${BLUE}选择要删除的转发配置。${RESET}"
 
-  if [ -z "$comment" ]; then
-    echo -e "${RED}备注不能为空。${RESET}"
+  local tmp
+  tmp="$(mktemp)"
+  collect_forward_configs "$tmp"
+
+  if [ ! -s "$tmp" ]; then
+    echo -e "${YELLOW}没有找到可删除的带备注 DNAT 转发规则。${RESET}"
+    rm -f "$tmp"
     return
   fi
 
   echo
-  echo -e "${CYAN}将删除以下规则：${RESET}"
-  pattern="$(comment_grep_pattern "$comment")"
-  iptables-save | grep -E -- "$pattern" || {
-    echo -e "${YELLOW}没有找到该备注对应的规则。${RESET}"
-    return
-  }
+  echo -e "${CYAN}当前转发配置：${RESET}"
+  printf "%-6s %-8s %-22s %-10s %-30s\n" "序号" "入站" "目标" "协议" "备注"
+  printf "%-6s %-8s %-22s %-10s %-30s\n" "----" "----" "----" "----" "----"
 
+  local configs=()
+  local idx=0
+  local comment in_port target_ip target_port existing_protocols
+
+  while IFS='|' read -r comment in_port target_ip target_port existing_protocols; do
+    idx=$((idx + 1))
+    configs[$idx]="$comment|$in_port|$target_ip|$target_port|$existing_protocols"
+    printf "%-6s %-8s %-22s %-10s %-30s\n" "$idx" "$in_port" "$target_ip:$target_port" "$(protocol_label "$existing_protocols")" "$comment"
+  done < "$tmp"
+
+  rm -f "$tmp"
+
+  echo
+  read -rp "请选择要删除的序号: " selected_index
+
+  case "$selected_index" in
+    ''|*[!0-9]*)
+      echo -e "${RED}序号无效。${RESET}"
+      return
+      ;;
+  esac
+
+  if [ "$selected_index" -lt 1 ] || [ "$selected_index" -gt "$idx" ]; then
+    echo -e "${RED}序号不存在。${RESET}"
+    return
+  fi
+
+  IFS='|' read -r comment in_port target_ip target_port existing_protocols <<< "${configs[$selected_index]}"
+  protocols="$(ask_protocols_for_delete)" || return
+
+  echo
+  echo -e "${CYAN}即将删除：${RESET}"
+  echo "序号: $selected_index"
+  echo "入站端口: $in_port"
+  echo "目标地址: $target_ip:$target_port"
+  echo "当前协议: $(protocol_label "$existing_protocols")"
+  echo "删除协议: $(protocol_label "$protocols")"
+  echo "备注: $comment"
   echo
   read -rp "确认删除？[y/N]: " yn
   case "$yn" in
     y|Y)
       backup_rules
-      delete_by_comment_core "$comment"
+      for proto in $protocols; do
+        if echo "$existing_protocols" | grep -qw "$proto"; then
+          delete_one_forward_selected "$in_port" "$target_ip" "$target_port" "$proto" "$comment"
+          remove_managed_forward_config "$in_port" "$target_port" "$proto" "$comment"
+          echo -e "${GREEN}已删除：$proto $in_port -> $target_ip:$target_port${RESET}"
+        else
+          echo -e "${YELLOW}跳过：该配置不存在 $proto 规则。${RESET}"
+        fi
+      done
       echo -e "${GREEN}删除完成。${RESET}"
       save_rules
       ;;
@@ -474,42 +820,6 @@ batch_delete_by_comment() {
         delete_by_comment_core "$c"
         echo -e "${GREEN}已删除：$c${RESET}"
       done
-      save_rules
-      ;;
-    *)
-      echo "已取消。"
-      ;;
-  esac
-}
-
-delete_by_exact_forward() {
-  echo
-  echo -e "${BLUE}按转发参数删除。${RESET}"
-
-  read -rp "入站端口，例如 8443: " in_port
-  read -rp "目标 IP，例如 1.1.1.1: " target_ip
-  read -rp "目标端口，例如 443: " target_port
-
-  protocols="$(ask_protocols)" || return
-
-  if [ -z "$in_port" ] || [ -z "$target_ip" ] || [ -z "$target_port" ]; then
-    echo -e "${RED}入站端口、目标 IP、目标端口不能为空。${RESET}"
-    return
-  fi
-
-  echo
-  echo -e "${CYAN}即将按参数删除：${RESET}"
-  echo "$protocols $in_port -> $target_ip:$target_port"
-  echo
-
-  read -rp "确认删除？[y/N]: " yn
-  case "$yn" in
-    y|Y)
-      backup_rules
-      for proto in $protocols; do
-        delete_one_forward_exact "$in_port" "$target_ip" "$target_port" "$proto"
-      done
-      echo -e "${GREEN}已尝试删除对应规则。${RESET}"
       save_rules
       ;;
     *)
@@ -589,7 +899,7 @@ export_conf() {
   out_file="${out_file:-$default_file}"
 
   echo "# iptables forward config exported by $APP_NAME $VERSION" > "$out_file"
-  echo "# format: in_port target_ip target_port protocol comment" >> "$out_file"
+  echo "# format: in_port target_ip_or_domain target_port protocol comment" >> "$out_file"
   echo "# protocol: tcp / udp / both" >> "$out_file"
   echo >> "$out_file"
 
@@ -604,6 +914,8 @@ export_conf() {
     target_port="${target##*:}"
     comment="$(get_rule_comment "$line")"
     [ -z "$comment" ] && comment="${DEFAULT_COMMENT_PREFIX}-${in_port}-to-${target_ip}-${target_port}"
+    managed_target="$(managed_target_for_rule "$in_port" "$target_port" "$proto" "$comment")"
+    [ -n "$managed_target" ] && target_ip="$managed_target"
     echo "$in_port $target_ip $target_port $proto $comment" >> "$tmp"
   done
 
@@ -628,8 +940,8 @@ parse_conf_preview() {
 
   echo
   echo -e "${CYAN}解析到以下配置：${RESET}"
-  printf "%-6s %-8s %-18s %-10s %-10s %-30s\n" "行号" "入站" "目标IP" "目标端口" "协议" "备注"
-  printf "%-6s %-8s %-18s %-10s %-10s %-30s\n" "----" "----" "------" "--------" "----" "----"
+  printf "%-6s %-8s %-28s %-10s %-10s %-30s\n" "行号" "入站" "目标IP/域名" "目标端口" "协议" "备注"
+  printf "%-6s %-8s %-28s %-10s %-10s %-30s\n" "----" "----" "----------" "--------" "----" "----"
 
   local line_no=0
 
@@ -660,7 +972,7 @@ parse_conf_preview() {
       continue
     fi
 
-    printf "%-6s %-8s %-18s %-10s %-10s %-30s\n" "$line_no" "$in_port" "$target_ip" "$target_port" "$proto_input" "$comment"
+    printf "%-6s %-8s %-28s %-10s %-10s %-30s\n" "$line_no" "$in_port" "$target_ip" "$target_port" "$proto_input" "$comment"
     valid_count=$((valid_count + 1))
   done < "$file"
 
@@ -785,11 +1097,11 @@ restore_backup() {
 
 test_target() {
   echo
-  read -rp "目标 IP，例如 1.1.1.1: " target_ip
+  read -rp "目标 IP/域名，例如 1.1.1.1 或 home.example.com: " target_ip
   read -rp "目标端口，例如 443: " target_port
 
   if [ -z "$target_ip" ] || [ -z "$target_port" ]; then
-    echo -e "${RED}目标 IP 和端口不能为空。${RESET}"
+    echo -e "${RED}目标 IP/域名和端口不能为空。${RESET}"
     return
   fi
 
@@ -853,7 +1165,7 @@ modify_rule() {
 
   echo
   read -rp "新入站端口: " in_port
-  read -rp "新目标 IP: " target_ip
+  read -rp "新目标 IP/域名: " target_ip
   read -rp "新目标端口: " target_port
   protocols="$(ask_protocols)" || return
   read -rp "新备注，留空继续使用旧备注: " new_comment
@@ -861,7 +1173,7 @@ modify_rule() {
   [ -z "$new_comment" ] && new_comment="$old_comment"
 
   if [ -z "$in_port" ] || [ -z "$target_ip" ] || [ -z "$target_port" ]; then
-    echo -e "${RED}新入站端口、目标 IP、目标端口不能为空。${RESET}"
+    echo -e "${RED}新入站端口、目标 IP/域名、目标端口不能为空。${RESET}"
     return
   fi
 
@@ -891,7 +1203,7 @@ modify_rule() {
 
 install_self_check_service() {
   echo
-  echo -e "${BLUE}安装开机自检 systemd 服务...${RESET}"
+  echo -e "${BLUE}安装自检/DDNS 刷新 systemd 服务...${RESET}"
 
   if [ ! -f "$SELF_PATH" ]; then
     echo -e "${RED}无法定位当前脚本路径：$SELF_PATH${RESET}"
@@ -913,23 +1225,40 @@ RemainAfterExit=no
 WantedBy=multi-user.target
 EOF
 
+  cat > /etc/systemd/system/ipt-forward-selfcheck.timer <<EOF
+[Unit]
+Description=run iptables forward manager self check periodically
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=ipt-forward-selfcheck.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
   systemctl enable ipt-forward-selfcheck.service
+  systemctl enable --now ipt-forward-selfcheck.timer
 
-  echo -e "${GREEN}已安装并启用 ipt-forward-selfcheck.service${RESET}"
+  echo -e "${GREEN}已安装并启用 ipt-forward-selfcheck.service / ipt-forward-selfcheck.timer${RESET}"
+  echo "默认每 5 分钟刷新一次域名/DDNS 转发。"
   echo "查看日志：cat $LOG_FILE"
-  log "self-check service installed"
+  log "self-check service and timer installed"
 }
 
 uninstall_self_check_service() {
-  echo -e "${BLUE}卸载开机自检 systemd 服务...${RESET}"
+  echo -e "${BLUE}卸载自检/DDNS 刷新 systemd 服务...${RESET}"
 
+  systemctl disable --now ipt-forward-selfcheck.timer >/dev/null 2>&1 || true
   systemctl disable ipt-forward-selfcheck.service >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/ipt-forward-selfcheck.timer
   rm -f /etc/systemd/system/ipt-forward-selfcheck.service
   systemctl daemon-reload
 
   echo -e "${GREEN}已卸载。${RESET}"
-  log "self-check service uninstalled"
+  log "self-check service and timer uninstalled"
 }
 
 self_check() {
@@ -953,6 +1282,8 @@ self_check() {
   local count
   count="$(iptables-save -t nat 2>/dev/null | grep -c "DNAT" || echo 0)"
   log "dnat rule count=$count"
+
+  refresh_managed_domain_forwards
 
   log "self-check end"
 }
@@ -985,26 +1316,26 @@ menu() {
   echo " 添加/删除/修改"
   echo "  8) 添加单条转发"
   echo "  9) 批量添加转发"
-  echo " 10) 按备注删除规则"
+  echo " 10) 选择配置删除规则"
   echo " 11) 批量按备注删除规则"
-  echo " 12) 按入站端口 + 目标 IP + 目标端口删除"
-  echo " 13) 修改已有规则"
+  echo " 12) 修改已有规则"
   echo
   echo " 配置导入导出"
-  echo " 14) 导出当前转发为 .conf"
-  echo " 15) 从 .conf 导入转发，导入前预览"
+  echo " 13) 导出当前转发为 .conf"
+  echo " 14) 从 .conf 导入转发，导入前预览"
   echo
   echo " 备份/回滚/测试"
-  echo " 16) 备份当前 iptables 规则"
-  echo " 17) 查看备份列表"
-  echo " 18) 从备份回滚"
-  echo " 19) 测试目标端口 TCP 可达性"
-  echo " 20) 保存当前规则"
+  echo " 15) 备份当前 iptables 规则"
+  echo " 16) 查看备份列表"
+  echo " 17) 从备份回滚"
+  echo " 18) 测试目标端口 TCP 可达性"
+  echo " 19) 保存当前规则"
   echo
-  echo " 开机自检/日志"
-  echo " 21) 安装开机自检服务"
-  echo " 22) 卸载开机自检服务"
-  echo " 23) 查看脚本日志"
+  echo " 自检/DDNS/日志"
+  echo " 20) 安装自检/DDNS 刷新服务"
+  echo " 21) 卸载自检/DDNS 刷新服务"
+  echo " 22) 查看脚本日志"
+  echo " 23) 刷新域名/DDNS 转发"
   echo
   echo "  0) 退出"
   echo "=================================================="
@@ -1035,18 +1366,18 @@ main() {
       9) batch_add_forward; pause ;;
       10) delete_by_comment; pause ;;
       11) batch_delete_by_comment; pause ;;
-      12) delete_by_exact_forward; pause ;;
-      13) modify_rule; pause ;;
-      14) export_conf; pause ;;
-      15) import_conf; pause ;;
-      16) backup_rules; pause ;;
-      17) list_backups; pause ;;
-      18) restore_backup; pause ;;
-      19) test_target; pause ;;
-      20) save_rules; pause ;;
-      21) install_self_check_service; pause ;;
-      22) uninstall_self_check_service; pause ;;
-      23) view_log; pause ;;
+      12) modify_rule; pause ;;
+      13) export_conf; pause ;;
+      14) import_conf; pause ;;
+      15) backup_rules; pause ;;
+      16) list_backups; pause ;;
+      17) restore_backup; pause ;;
+      18) test_target; pause ;;
+      19) save_rules; pause ;;
+      20) install_self_check_service; pause ;;
+      21) uninstall_self_check_service; pause ;;
+      22) view_log; pause ;;
+      23) refresh_managed_domain_forwards; pause ;;
       0) exit 0 ;;
       *) echo -e "${RED}无效选择。${RESET}"; pause ;;
     esac
